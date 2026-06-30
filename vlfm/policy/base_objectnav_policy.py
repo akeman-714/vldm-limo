@@ -13,7 +13,6 @@ from torch import Tensor
 from vlfm.mapping.object_point_cloud_map import ObjectPointCloudMap
 from vlfm.mapping.obstacle_map import ObstacleMap
 from vlfm.obs_transformers.utils import image_resize
-from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
 from vlfm.utils.geometry_utils import get_fov, rho_theta
 from vlfm.utils.goal_plan import Goal, GoalQueue, decompose
 from vlfm.utils.object_memory import recall_object, remember_object
@@ -60,6 +59,13 @@ class BaseObjectNavPolicy(BasePolicy):
     _non_coco_caption = ""
     _load_yolo: bool = True
 
+    class _DisabledPointNavPolicy:
+        def reset(self) -> None:
+            pass
+
+        def act(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("PointNav is disabled for this policy instance.")
+
     def __init__(
         self,
         pointnav_policy_path: str,
@@ -77,6 +83,7 @@ class BaseObjectNavPolicy(BasePolicy):
         vqa_prompt: str = "Is this ",
         coco_threshold: float = 0.8,
         non_coco_threshold: float = 0.4,
+        load_pointnav_policy: bool = True,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -87,7 +94,14 @@ class BaseObjectNavPolicy(BasePolicy):
         self._use_vqa = use_vqa
         if use_vqa:
             self._vqa = BLIP2Client(port=int(os.environ.get("BLIP2_PORT", "12185")))
-        self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
+        if load_pointnav_policy:
+            # Imported lazily: the Limo/Nav2 path (load_pointnav_policy=False) skips
+            # PointNav entirely, so it need not install gym/habitat just to import.
+            from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
+
+            self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
+        else:
+            self._pointnav_policy = self._DisabledPointNavPolicy()
         self._object_map: ObjectPointCloudMap = ObjectPointCloudMap(erosion_size=object_map_erosion_size)
         self._depth_image_shape = tuple(depth_image_shape)
         self._pointnav_stop_radius = pointnav_stop_radius
@@ -359,6 +373,20 @@ class BaseObjectNavPolicy(BasePolicy):
         return self._verification_enabled and bool(self._predicate) and bool(self._target_object)
 
     def _verify_on_arrival(self, observations: "TensorDict", robot_xy: np.ndarray) -> Union[None, Tensor]:
+        match = self._attribute_match(observations, robot_xy)
+        if match is False:
+            return self._reject_and_continue(observations, robot_xy, reason=self._last_verify_result)
+        return None
+
+    def _attribute_match(self, observations: "TensorDict", robot_xy: np.ndarray) -> Union[bool, None]:
+        """Return the attribute verification verdict for the current arrival crop.
+
+        ``True`` means the crop matches the requested predicate, ``False`` means it
+        should be rejected, and ``None`` means verification is disabled or skipped
+        (fail-open / no crop / budget exhausted). The old Habitat action path maps
+        ``False`` back to ``_reject_and_continue`` in ``_verify_on_arrival``; the
+        Limo/Nav2 path reuses this pure verdict from ``on_goal_reached``.
+        """
         if not self._should_verify_on_arrival():
             return None
 
@@ -374,7 +402,7 @@ class BaseObjectNavPolicy(BasePolicy):
             print(f"[attr] {self._last_verify_result}", flush=True)
             if os.environ.get("VLFM_ATTR_FAIL_OPEN", "1") == "1":
                 return None
-            return self._reject_and_continue(observations, robot_xy, reason=self._last_verify_result)
+            return False
 
         self._verify_calls += 1
         timeout = float(os.environ.get("VLFM_ATTR_VERIFY_TIMEOUT", "3.0"))
@@ -389,8 +417,8 @@ class BaseObjectNavPolicy(BasePolicy):
         print(f"[attr] {self._last_verify_result}", flush=True)
         if match:
             self._attribute_verified = True
-            return None
-        return self._reject_and_continue(observations, robot_xy, reason=self._last_verify_result)
+            return True
+        return False
 
     def _guard_attribute_stop(
         self,

@@ -1,5 +1,7 @@
 # 17 · Limo Gazebo / ROS2 仿真理解与调试手册
 
+> 状态提示（2026-06-30）：这篇仍适合理解 mentor 的 Gazebo/ROS2 仿真组成；VLFM 最终耦合状态、代码接口和 G2/G3 验收结果见 [26_Limo_Gazebo_VLFM_最终耦合说明与接口.md](./26_Limo_Gazebo_VLFM_最终耦合说明与接口.md)。
+
 ## 0. 这份文档解决什么问题
 
 目标不是立刻接 VLFM，而是让你知道 mentor 的 Gazebo/ROS2 仿真到底怎么运转、每个核心部件负责什么、怎么通过命令、打印、RViz/Gazebo 可视化去验证它。
@@ -921,4 +923,3 @@ TF:
 ```
 
 这些通过后，VLFM adapter 才有稳定输入输出。
-

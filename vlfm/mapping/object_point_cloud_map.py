@@ -5,7 +5,16 @@ from typing import Dict, List, Tuple, Union
 
 import cv2
 import numpy as np
-import open3d as o3d
+
+try:  # open3d has no aarch64/py3.12 wheel; fall back to scikit-learn for DBSCAN.
+    import open3d as o3d
+except ImportError:
+    o3d = None
+
+try:
+    from sklearn.cluster import DBSCAN as _SklearnDBSCAN
+except ImportError:
+    _SklearnDBSCAN = None
 
 from vlfm.utils.geometry_utils import (
     extract_yaw,
@@ -16,10 +25,10 @@ from vlfm.utils.geometry_utils import (
 
 
 class ObjectPointCloudMap:
-    clouds: Dict[str, np.ndarray] = {}
     use_dbscan: bool = True
 
     def __init__(self, erosion_size: float) -> None:
+        self.clouds: Dict[str, np.ndarray] = {}
         self._erosion_size = erosion_size
         self.last_target_coord: Union[np.ndarray, None] = None
         self._rejected: Dict[str, List[Tuple[np.ndarray, float]]] = {}
@@ -227,12 +236,21 @@ class ObjectPointCloudMap:
         return closest_point
 
 
-def open3d_dbscan_filtering(points: np.ndarray, eps: float = 0.2, min_points: int = 100) -> np.ndarray:
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+def _dbscan_labels(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
+    """DBSCAN labels via open3d (preferred) or scikit-learn (aarch64 fallback)."""
+    if o3d is not None:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        return np.array(pcd.cluster_dbscan(eps, min_points))
+    if _SklearnDBSCAN is not None:
+        # open3d min_points (points to form a cluster) ~ sklearn min_samples.
+        return _SklearnDBSCAN(eps=eps, min_samples=min_points).fit_predict(points)
+    raise ImportError("DBSCAN filtering needs open3d or scikit-learn; neither is installed.")
 
+
+def open3d_dbscan_filtering(points: np.ndarray, eps: float = 0.2, min_points: int = 100) -> np.ndarray:
     # Perform DBSCAN clustering
-    labels = np.array(pcd.cluster_dbscan(eps, min_points))
+    labels = _dbscan_labels(points, eps, min_points)
 
     # Count the points in each cluster
     unique_labels, label_counts = np.unique(labels, return_counts=True)
