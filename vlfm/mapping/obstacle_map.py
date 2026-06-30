@@ -217,6 +217,54 @@ class ObstacleMap(BaseMap):
         else:
             self.frontiers = self._px_to_xy(self._frontiers_px)
 
+    def update_from_occupancy_grid(
+        self,
+        grid: np.ndarray,
+        resolution: float,
+        origin_xy: np.ndarray,
+        occ_thresh: int = 65,
+    ) -> None:
+        """Refresh obstacle/explored maps from a ROS ``OccupancyGrid`` array.
+
+        ``grid`` is indexed as ``[row, col]`` after reshaping
+        ``nav_msgs/OccupancyGrid.data`` to ``(height, width)``. The grid origin is
+        assumed to have zero yaw; RTAB-Map's default 2D map satisfies this. Known
+        cells are accumulated monotonically so small SLAM updates do not erase
+        already-observed frontier context.
+        """
+        if grid.ndim != 2:
+            raise ValueError(f"Occupancy grid must be 2D, got shape {grid.shape}")
+
+        known_rows, known_cols = np.nonzero(grid != -1)
+        if len(known_cols) == 0:
+            return
+
+        origin_xy = np.asarray(origin_xy, dtype=np.float64).reshape(2)
+        world_x = origin_xy[0] + (known_cols.astype(np.float64) + 0.5) * float(resolution)
+        world_y = origin_xy[1] + (known_rows.astype(np.float64) + 0.5) * float(resolution)
+        pixels = self._xy_to_px(np.stack([world_x, world_y], axis=1))
+        cols, rows = pixels[:, 0], pixels[:, 1]
+
+        in_bounds = (rows >= 0) & (rows < self.size) & (cols >= 0) & (cols < self.size)
+        if not np.any(in_bounds):
+            return
+
+        rows = rows[in_bounds]
+        cols = cols[in_bounds]
+        vals = grid[known_rows[in_bounds], known_cols[in_bounds]]
+
+        self.explored_area[rows, cols] = True
+        occupied = vals >= occ_thresh
+        self._map[rows[occupied], cols[occupied]] = True
+
+        self._recompute_navigable()
+        self.explored_area[self._navigable_map == 0] = False
+        self._frontiers_px = self._get_frontiers()
+        if len(self._frontiers_px) == 0:
+            self.frontiers = np.array([])
+        else:
+            self.frontiers = self._px_to_xy(self._frontiers_px)
+
     def _get_frontiers(self) -> np.ndarray:
         """Returns the frontiers of the map."""
         # Dilate the explored area slightly to prevent small gaps between the explored
