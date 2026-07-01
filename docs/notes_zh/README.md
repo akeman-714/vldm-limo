@@ -39,6 +39,7 @@
 | [24_Nav2耦合_M5_抢占朝向_联调验收_排障.md](./24_Nav2耦合_M5_抢占朝向_联调验收_排障.md) | 抢占节奏 + 到点朝向 + 端到端验收 + 全局排障矩阵 | **联调/排障** |
 | [25_DGX同机mentor_Gazebo_ROS2环境接入手册.md](./25_DGX同机mentor_Gazebo_ROS2环境接入手册.md) | 同一台 DGX 上复用 mentor 的 Limo Gazebo/ROS2/Nav2 环境:权限 ACL/source/venv/G0-G1 验收 | **环境接入** |
 | [26_Limo_Gazebo_VLFM_最终耦合说明与接口.md](./26_Limo_Gazebo_VLFM_最终耦合说明与接口.md) | 当前最终事实来源:G2/G3 在线验收、代码地图、接口、运行命令、旧文档状态 | **最终入口** |
+| [27_ROS2_Gazebo_VLFM_玩法教学_从零理解.md](./27_ROS2_Gazebo_VLFM_玩法教学_从零理解.md) | 从零理解 ROS2 节点/订阅/数据格式/链路 + Gazebo + VLFM 接在哪;每个概念配一条本机能敲的命令 + 闯关式动手玩法 + 可运行最小节点 | **零基础入门/动手** |
 
 如果你只读一篇：
 
