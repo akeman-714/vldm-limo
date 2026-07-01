@@ -19,7 +19,7 @@ try:
     from cv_bridge import CvBridge
     from geometry_msgs.msg import PoseStamped, Quaternion
     from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
-    from nav_msgs.msg import OccupancyGrid
+    from nav_msgs.msg import OccupancyGrid, Odometry
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import CameraInfo, Image
@@ -34,6 +34,7 @@ except Exception as e:  # pragma: no cover - exercised on ROS machines
     BasicNavigator = None
     TaskResult = None
     OccupancyGrid = None
+    Odometry = None
     QoSProfile = None
     ReliabilityPolicy = None
     DurabilityPolicy = None
@@ -89,6 +90,53 @@ def quaternion_from_yaw(yaw: float) -> Any:
     return q
 
 
+def transform_to_matrix(tf_msg: Any) -> np.ndarray:
+    """Convert a ROS TransformStamped-like object to a 4x4 matrix."""
+    t = tf_msg.transform.translation
+    q = tf_msg.transform.rotation
+    return translation_rotation_to_matrix(t, q)
+
+
+def pose_to_matrix(pose_msg: Any) -> np.ndarray:
+    """Convert a ROS Pose-like object to a 4x4 matrix."""
+    return translation_rotation_to_matrix(pose_msg.position, pose_msg.orientation)
+
+
+def translation_rotation_to_matrix(translation: Any, rotation: Any) -> np.ndarray:
+    t = translation
+    q = rotation
+    x = float(q.x)
+    y = float(q.y)
+    z = float(q.z)
+    w = float(q.w)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-12:
+        x = y = z = 0.0
+        w = 1.0
+    else:
+        x /= norm
+        y /= norm
+        z /= norm
+        w /= norm
+
+    mat = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), float(t.x)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), float(t.y)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), float(t.z)],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return mat
+
+
+def pose_from_matrix(tf_matrix: np.ndarray) -> tuple[np.ndarray, float]:
+    xyz = np.asarray(tf_matrix[:3, 3], dtype=np.float64)
+    yaw = float(math.atan2(tf_matrix[1, 0], tf_matrix[0, 0]))
+    return xyz, yaw
+
+
 def build_limo_observation_cache(
     rgb: np.ndarray,
     depth_raw: np.ndarray,
@@ -107,7 +155,12 @@ def build_limo_observation_cache(
     max_depth: float,
 ) -> dict:
     depth = normalize_depth_array(depth_raw, depth_encoding, min_depth, max_depth)
-    tf_cam2map = xyz_yaw_to_tf_matrix(np.asarray(cam_xyz, dtype=np.float64), cam_yaw)
+    # depth_link is a ROS optical frame (z forward, x right, y down), while
+    # geometry_utils.get_point_cloud() returns VLFM/Habitat-style points
+    # (x forward, y left, z up).  Use the robot/body yaw for that corrected
+    # point cloud; using the optical frame yaw rotates object goals by the
+    # camera optical-frame offset.
+    tf_cam2map = xyz_yaw_to_tf_matrix(np.asarray(cam_xyz, dtype=np.float64), base_yaw)
     obstacle_map.update_from_occupancy_grid(
         np.asarray(grid, dtype=np.int8),
         grid_resolution,
@@ -243,9 +296,12 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
         self.depth_topic = self._declare("depth_topic", "/camera/aligned_depth_to_color/image_raw")
         self.camera_info_topic = self._declare("camera_info_topic", "/camera/color/camera_info")
         self.map_topic = self._declare("map_topic", "/map")
+        self.odom_topic = self._declare("odom_topic", "/odom")
         self.map_frame = self._declare("map_frame", "map")
+        self.odom_frame = self._declare("odom_frame", "odom")
         self.base_frame = self._declare("base_frame", "base_link")
         self.camera_frame = self._declare("camera_frame", "camera_color_optical_frame")
+        self.pose_lookup_mode = str(self._declare("pose_lookup_mode", "chain_fallback"))
         self.min_depth = float(self._declare("min_depth", 0.3))
         self.max_depth = float(self._declare("max_depth", 3.0))
         self.map_size = int(self._declare("map_size", 1000))
@@ -256,6 +312,7 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
         self.obstacle_map_area_threshold = float(self._declare("obstacle_map_area_threshold", 1.5))
         self.publish_debug_images_enabled = bool(self._declare("publish_debug_images", True))
         self.debug_image_period = float(self._declare("debug_image_period", 0.5))
+        self.log_tf_pose = bool(self._declare("log_tf_pose", True))
 
         self.bridge = CvBridge()
         self.tf_buffer = tf2_ros.Buffer()
@@ -273,6 +330,7 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
         self.latest_depth_raw: Optional[np.ndarray] = None
         self.latest_depth_encoding = ""
         self.latest_map: Optional[Any] = None
+        self.latest_odom: Optional[Any] = None
         self.fx: Optional[float] = None
         self.fy: Optional[float] = None
 
@@ -287,6 +345,7 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self._map_sub = self.create_subscription(OccupancyGrid, self.map_topic, self._map_cb, map_qos)
+        self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_cb, 20)
         self._goal_pub = self.create_publisher(PoseStamped, "/vlfm/goal", 10)
         self._frontier_pub = self.create_publisher(MarkerArray, "/vlfm/frontiers", 1)
         self._debug_image_pubs = {
@@ -296,6 +355,10 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
             "object_map": self.create_publisher(Image, "/vlfm/vis/object_map", 1),
         }
         self._last_debug_image_time = 0.0
+        self._obs_step = 0
+        self._last_logged_base_xyz: Optional[np.ndarray] = None
+        self._last_logged_base_yaw: Optional[float] = None
+        self._last_pose_fallback_log_time = 0.0
 
     def _declare(self, name: str, default: Any) -> Any:
         self.declare_parameter(name, default)
@@ -314,12 +377,95 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
     def _map_cb(self, msg: Any) -> None:
         self.latest_map = msg
 
+    def _odom_cb(self, msg: Any) -> None:
+        self.latest_odom = msg
+
     def lookup_pose(self, target_frame: str) -> tuple[np.ndarray, float]:
-        tf = self.tf_buffer.lookup_transform(self.map_frame, target_frame, rclpy.time.Time())
+        stamp = rclpy.time.Time() if rclpy is not None else None
+        tf = self.tf_buffer.lookup_transform(self.map_frame, target_frame, stamp)
         t = tf.transform.translation
         xyz = np.array([t.x, t.y, t.z], dtype=np.float64)
         yaw = yaw_from_quaternion(tf.transform.rotation)
         return xyz, yaw
+
+    def lookup_transform_matrix(self, target_frame: str, source_frame: str) -> np.ndarray:
+        stamp = rclpy.time.Time() if rclpy is not None else None
+        tf = self.tf_buffer.lookup_transform(target_frame, source_frame, stamp)
+        return transform_to_matrix(tf)
+
+    def lookup_observation_poses(self) -> tuple[np.ndarray, float, np.ndarray, float, str]:
+        if self.pose_lookup_mode == "direct":
+            base_xyz, base_yaw = self.lookup_pose(self.base_frame)
+            cam_xyz, cam_yaw = self.lookup_pose(self.camera_frame)
+            return base_xyz, base_yaw, cam_xyz, cam_yaw, "direct"
+        if self.pose_lookup_mode == "odom_topic":
+            return self.lookup_observation_poses_from_odom_topic()
+
+        try:
+            tf_map_odom = self.lookup_transform_matrix(self.map_frame, self.odom_frame)
+            tf_odom_base = self.lookup_transform_matrix(self.odom_frame, self.base_frame)
+            tf_base_cam = self.lookup_transform_matrix(self.base_frame, self.camera_frame)
+            tf_map_base = tf_map_odom @ tf_odom_base
+            tf_map_cam = tf_map_base @ tf_base_cam
+            base_xyz, base_yaw = pose_from_matrix(tf_map_base)
+            cam_xyz, cam_yaw = pose_from_matrix(tf_map_cam)
+            return base_xyz, base_yaw, cam_xyz, cam_yaw, "chain"
+        except Exception as e:
+            if self.pose_lookup_mode == "chain":
+                raise
+            now = time.time()
+            if now - self._last_pose_fallback_log_time > 5.0:
+                self.get_logger().warn(f"Explicit TF chain failed ({e}); falling back to direct map lookups.")
+                self._last_pose_fallback_log_time = now
+            base_xyz, base_yaw = self.lookup_pose(self.base_frame)
+            cam_xyz, cam_yaw = self.lookup_pose(self.camera_frame)
+            return base_xyz, base_yaw, cam_xyz, cam_yaw, "direct-fallback"
+
+    def lookup_observation_poses_from_odom_topic(self) -> tuple[np.ndarray, float, np.ndarray, float, str]:
+        if self.latest_odom is None:
+            raise RuntimeError("Odometry has not arrived yet.")
+        tf_map_odom = self.lookup_transform_matrix(self.map_frame, self.odom_frame)
+        tf_odom_base = pose_to_matrix(self.latest_odom.pose.pose)
+        tf_base_cam = self.lookup_transform_matrix(self.base_frame, self.camera_frame)
+        tf_map_base = tf_map_odom @ tf_odom_base
+        tf_map_cam = tf_map_base @ tf_base_cam
+        base_xyz, base_yaw = pose_from_matrix(tf_map_base)
+        cam_xyz, cam_yaw = pose_from_matrix(tf_map_cam)
+        return base_xyz, base_yaw, cam_xyz, cam_yaw, "odom_topic"
+
+    def log_observation_tf_pose(
+        self,
+        base_xyz: np.ndarray,
+        base_yaw: float,
+        cam_xyz: np.ndarray,
+        cam_yaw: float,
+        pose_source: str,
+    ) -> None:
+        if not self.log_tf_pose:
+            return
+
+        if self._last_logged_base_xyz is None or self._last_logged_base_yaw is None:
+            dxy_text = "nan"
+            dyaw_text = "nan"
+        else:
+            dxy = float(np.linalg.norm(np.asarray(base_xyz)[:2] - self._last_logged_base_xyz[:2]))
+            dyaw = math.atan2(
+                math.sin(float(base_yaw) - self._last_logged_base_yaw),
+                math.cos(float(base_yaw) - self._last_logged_base_yaw),
+            )
+            dxy_text = f"{dxy:.4f}"
+            dyaw_text = f"{dyaw:.4f}"
+
+        print(
+            f"[limo] obs={self._obs_step} pose={pose_source} "
+            f"tf_base(map) xyz={np.round(base_xyz, 3).tolist()} "
+            f"yaw={float(base_yaw):.3f} dxy={dxy_text} dyaw={dyaw_text} "
+            f"tf_cam(map) xyz={np.round(cam_xyz, 3).tolist()} yaw={float(cam_yaw):.3f}",
+            flush=True,
+        )
+        self._obs_step += 1
+        self._last_logged_base_xyz = np.asarray(base_xyz, dtype=np.float64).copy()
+        self._last_logged_base_yaw = float(base_yaw)
 
     def build_observation(self) -> dict:
         if self.latest_rgb is None or self.latest_depth_raw is None:
@@ -328,9 +474,11 @@ class LimoVLFMNode(Node):  # type: ignore[misc]
             raise RuntimeError("CameraInfo has not arrived yet.")
         if self.latest_map is None:
             raise RuntimeError("OccupancyGrid has not arrived yet.")
+        if self.pose_lookup_mode == "odom_topic" and self.latest_odom is None:
+            raise RuntimeError("Odometry has not arrived yet.")
 
-        base_xyz, base_yaw = self.lookup_pose(self.base_frame)
-        cam_xyz, cam_yaw = self.lookup_pose(self.camera_frame)
+        base_xyz, base_yaw, cam_xyz, cam_yaw, pose_source = self.lookup_observation_poses()
+        self.log_observation_tf_pose(base_xyz, base_yaw, cam_xyz, cam_yaw, pose_source)
 
         grid_msg = self.latest_map
         grid = np.asarray(grid_msg.data, dtype=np.int8).reshape(grid_msg.info.height, grid_msg.info.width)
@@ -440,12 +588,19 @@ def run_nav2_mission(
     if BasicNavigator is None or TaskResult is None or rclpy is None:
         raise ImportError("Nav2 simple commander is not available in this environment.")
 
+    def pump_node(max_callbacks: int = 20, timeout_sec: float = 0.0) -> None:
+        # A single spin_once can be monopolized by high-rate RGB-D/TF callbacks.
+        # Drain a small batch so slower-but-critical state like /odom is fresh
+        # before build_observation() snapshots the cache.
+        for _ in range(max_callbacks):
+            rclpy.spin_once(node, timeout_sec=timeout_sec)
+
     def wait_for_observation(label: str, timeout_sec: float = 30.0) -> dict:
         start = time.time()
         last_log = 0.0
         last_error = ""
         while rclpy.ok() and time.time() - start < timeout_sec:
-            rclpy.spin_once(node, timeout_sec=0.05)
+            pump_node(max_callbacks=20, timeout_sec=0.01)
             try:
                 return node.build_observation()
             except Exception as e:
@@ -467,7 +622,7 @@ def run_nav2_mission(
         navigator.spin(spin_dist=2.0 * math.pi)
         warm = 0.0
         while not navigator.isTaskComplete():
-            rclpy.spin_once(node, timeout_sec=0.05)
+            pump_node(max_callbacks=20, timeout_sec=0.0)
             if time.time() - warm < 0.5:
                 continue
             warm = time.time()
@@ -479,6 +634,7 @@ def run_nav2_mission(
 
     current = None
     while rclpy.ok():
+        pump_node(max_callbacks=20, timeout_sec=0.0)
         obs = node.build_observation()
         node.publish_frontier_markers(obs["frontier_sensor"])
         candidate = policy.decide_goal(obs)
@@ -493,7 +649,7 @@ def run_nav2_mission(
 
         last_decide = time.time()
         while not navigator.isTaskComplete():
-            rclpy.spin_once(node, timeout_sec=0.05)
+            pump_node(max_callbacks=20, timeout_sec=0.0)
             if time.time() - last_decide < 1.0 / max(decide_hz, 1e-6):
                 continue
             last_decide = time.time()
@@ -507,6 +663,7 @@ def run_nav2_mission(
 
         result = navigator.getResult()
         if result == TaskResult.SUCCEEDED:
+            pump_node(max_callbacks=20, timeout_sec=0.0)
             verdict = policy.on_goal_reached(node.build_observation(), current)
             node.announce(f"[arrive] {current['mode']} accepted={verdict['accepted']} {verdict['reason']}")
             if verdict["accepted"] and verdict["next"] == "done":
