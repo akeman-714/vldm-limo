@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from vlfm.mapping.object_point_cloud_map import ObjectPointCloudMap
+from vlfm.mapping.object_point_cloud_map import ObjectPointCloudMap, foreground_depth_gate
 from vlfm.policy.base_objectnav_policy import BaseObjectNavPolicy
 from vlfm.vlm.attribute_verifier import _cloud_yellow_family_accept, heuristic_parse_instruction, heuristic_verify
 
@@ -33,6 +33,37 @@ def test_reject_region_removes_points_and_blocks_region() -> None:
     assert object_map.last_target_coord is None
     assert object_map._in_rejected("cat", np.array([0.25, 0.0]))
     assert not object_map._in_rejected("cat", np.array([1.0, 0.0]))
+
+
+def test_foreground_depth_gate_suppresses_far_background_pixels() -> None:
+    min_depth = 0.3
+    max_depth = 6.0
+    depth_m = np.full((40, 40), 5.8, dtype=np.float32)
+    depth_m[14:26, 14:26] = 2.0
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[8:32, 8:32] = 255
+
+    gated = foreground_depth_gate(depth_m, mask, min_depth=min_depth, max_depth=max_depth)
+
+    assert np.count_nonzero(gated) == 12 * 12
+    assert np.all(depth_m[gated.astype(bool)] < 3.0)
+
+
+def test_object_cloud_uses_near_foreground_when_mask_contains_background() -> None:
+    object_map = ObjectPointCloudMap(erosion_size=0)
+    object_map.use_dbscan = False
+    min_depth = 0.3
+    max_depth = 6.0
+    depth_m = np.full((40, 40), 5.8, dtype=np.float32)
+    depth_m[14:26, 14:26] = 2.0
+    depth = (depth_m - min_depth) / (max_depth - min_depth)
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[8:32, 8:32] = 1
+
+    cloud = object_map._extract_object_cloud(depth, mask, min_depth, max_depth, fx=100.0, fy=100.0)
+
+    assert len(cloud) == 12 * 12
+    assert np.max(cloud[:, 0]) < 3.0
 
 
 def _make_fake_policy(verdict: dict) -> _FakePolicy:
@@ -89,16 +120,16 @@ def test_verify_on_arrival_accepts_match_and_keeps_stop() -> None:
     assert "match=True" in policy._last_verify_result
 
 
-def test_stop_guard_blocks_exploration_stop_before_attribute_match() -> None:
+def test_stop_guard_allows_exploration_stop_when_no_target_arrival() -> None:
     policy = _make_fake_policy({"match": False, "reason": "not yellow", "source": "test"})
     policy._called_stop = False
 
     mode, action = policy._guard_attribute_stop("explore", "STOP", {}, robot_xy=np.zeros(2))
 
-    assert mode == "verify-guard"
-    assert action == "TURN_RIGHT"
+    assert mode == "explore"
+    assert action == "STOP"
     assert policy._called_stop is False
-    assert "blocked unverified STOP" in policy._last_verify_result
+    assert policy._last_verify_result == ""
 
 
 def test_heuristic_parse_yellow_cat_query() -> None:

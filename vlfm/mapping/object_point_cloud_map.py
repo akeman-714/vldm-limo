@@ -195,12 +195,13 @@ class ObjectPointCloudMap:
         fx: float,
         fy: float,
     ) -> np.ndarray:
-        final_mask = object_mask * 255
+        final_mask = (object_mask.astype(np.uint8)) * 255
         final_mask = cv2.erode(final_mask, None, iterations=self._erosion_size)  # type: ignore
 
         valid_depth = depth.copy()
         valid_depth[valid_depth == 0] = 1  # set all holes (0) to just be far (1)
         valid_depth = valid_depth * (max_depth - min_depth) + min_depth
+        final_mask = foreground_depth_gate(valid_depth, final_mask, min_depth, max_depth)
         cloud = get_point_cloud(valid_depth, final_mask, fx, fy)
         cloud = get_random_subarray(cloud, 5000)
         if self.use_dbscan:
@@ -234,6 +235,48 @@ class ObjectPointCloudMap:
                 median_index = 0
             closest_point = cloud[median_index]
         return closest_point
+
+
+def foreground_depth_gate(
+    depth_m: np.ndarray,
+    mask: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+) -> np.ndarray:
+    """Keep the near, depth-consistent foreground inside an instance mask.
+
+    Thin Gazebo objects such as chairs often leave background wall/floor pixels
+    inside a visually correct SAM mask.  If those far pixels form the largest
+    DBSCAN cluster, the robot navigates toward the background instead of the
+    detected object.  The gate is intentionally conservative: when there are too
+    few valid near-depth pixels, it falls back to the original mask.
+    """
+    enabled = os.environ.get("VLFM_OBJECT_DEPTH_GATE", "1").lower() not in {"0", "false", "off", "no"}
+    if not enabled:
+        return mask
+
+    mask_bool = mask.astype(bool)
+    if not np.any(mask_bool):
+        return mask
+
+    min_pixels = int(os.environ.get("VLFM_OBJECT_DEPTH_GATE_MIN_PIXELS", "50"))
+    valid = (
+        mask_bool
+        & np.isfinite(depth_m)
+        & (depth_m > float(min_depth))
+        & (depth_m < float(max_depth) * 0.98)
+    )
+    if int(np.count_nonzero(valid)) < min_pixels:
+        return mask
+
+    percentile = float(os.environ.get("VLFM_OBJECT_DEPTH_GATE_PERCENTILE", "25"))
+    band_m = float(os.environ.get("VLFM_OBJECT_DEPTH_GATE_BAND_M", "0.75"))
+    near_depth = float(np.percentile(depth_m[valid], percentile))
+    gated = valid & (depth_m <= near_depth + band_m)
+    if int(np.count_nonzero(gated)) < min_pixels:
+        return mask
+
+    return (gated.astype(np.uint8)) * 255
 
 
 def _dbscan_labels(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
